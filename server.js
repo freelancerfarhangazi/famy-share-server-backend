@@ -4,13 +4,12 @@ require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
 const cloudinary = require('cloudinary').v2;
-const https = require('https'); // <<< FIX 1: Essential for the download route
+const https = require('https'); 
 
 const app = express();
 const port = 3000;
 
 // --- 1. CLOUDINARY CONFIGURATION ---
-// This connects the application to your free Cloudinary account
 cloudinary.config({
     cloud_name: process.env.CLOUD_NAME,
     api_key: process.env.API_KEY,
@@ -18,16 +17,12 @@ cloudinary.config({
 });
 
 // --- 2. MULTER CONFIGURATION (Memory Storage) ---
-// This tells multer to temporarily store the file in server memory 
 const storage = multer.memoryStorage();
 const upload = multer({ storage: storage });
 
 
 // --- Middleware ---
-
-// Enable CORS for frontend communication
 app.use((req, res, next) => {
-    // This allows your frontend (even if local) to talk to the Render server
     res.header('Access-Control-Allow-Origin', '*'); 
     res.header('Access-Control-Allow-Methods', 'GET, POST');
     res.header('Access-Control-Allow-Headers', 'Content-Type');
@@ -44,40 +39,56 @@ function generateUniqueId(length = 8) {
     return result;
 }
 
-// --- DOWNLOAD ROUTE (FINAL FIXES) ---
-// This handles requests like: https://famy-share-server-backend.onrender.com/xYIZ2Tgh
+// --- MOCK DATABASE (To track unique IDs and their Cloudinary URLs) ---
+// This is the database that stores the link between uniqueId and the Cloudinary URL.
+const mockDatabase = {};
+
+// 🚨 Hardcoded Test File: This permanent entry is essential for the /PERMTEST download to work reliably.
+mockDatabase['PERMTEST'] = {
+    fileName: 'Test_File_From_Cloudinary.jpg', 
+    fileUrl: 'https://res.cloudinary.com/djv2fivzd/image/upload/v1765457264/famy_share_uploads/somtbvanr2vv0gzwktro.png', // <<< REPLACE THIS URL WITH A PERMANENT URL FROM YOUR OWN CLOUDINARY ACCOUNT
+}; 
+
+
+// --- DOWNLOAD ROUTE (FIXED: Uses mockDatabase) ---
 app.get('/:uniqueId', async (req, res) => {
     const uniqueId = req.params.uniqueId;
     console.log(`Received GET request for download ID: ${uniqueId}`);
 
-    // --- MOCK DATABASE LOOKUP and File URL ---
-    // NOTE: Replace this mock URL with the URL of the last file you successfully uploaded
-    // (e.g., https://res.cloudinary.com/djv2fivzd/image/upload/v1765457264/famy_share_uploads/somtbvanr2vv0gzwktro.png)
-    const mockFileUrl = "https://res.cloudinary.com/djv2fivzd/image/upload/v1765457264/famy_share_uploads/somtbvanr2vv0gzwktro.png"; 
+    // 1. Look up the file URL in the mock database
+    const fileData = mockDatabase[uniqueId];
 
+    if (!fileData || !fileData.fileUrl) {
+        console.error(`Download failed: ID ${uniqueId} not found in mockDatabase.`);
+        return res.status(404).send('File not found or link has expired.');
+    }
     
-    // --- Extract the correct filename from the URL for the download header ---
-    const urlParts = mockFileUrl.split('/');
-    const actualFileName = urlParts[urlParts.length - 1]; 
+    const actualFileUrl = fileData.fileUrl;
+    const actualFileName = fileData.fileName;
     
+    // --- DEBUGGING: Print the URL to confirm it's valid ---
+    console.log(`Attempting to fetch from Cloudinary: ${actualFileUrl}`);
     
-    // --- File Download Logic ---
-    
-    // 1. Set the correct headers using the extracted filename!
+    // 1. Set the correct headers
     res.set({
-        // FIX 3: Ensures correct extension is used by extracting the name from the URL
         'Content-Disposition': `attachment; filename="${actualFileName}"`, 
         'Content-Type': 'application/octet-stream', 
     });
 
     try {
         // 2. Stream the file from the remote URL (Cloudinary) to the user's browser
-        https.get(mockFileUrl, (stream) => {
-            // Pipe the stream directly to the response, starting the download
+        // We use https.get because the Cloudinary URL is HTTPS
+        https.get(actualFileUrl, (stream) => { 
+            // Add error handling on the stream itself
+            stream.on('error', (err) => {
+                 console.error('Stream Error (Source):', err.message);
+                 res.destroy(); 
+            });
             stream.pipe(res);
+            
         }).on('error', (err) => {
-            console.error('Error fetching file from Cloudinary:', err.message);
-            res.status(500).send('Error retrieving file from storage.');
+            console.error('Request Error (Target):', err.message);
+            res.status(500).send('Error retrieving file from storage (Request failed).');
         });
         
     } catch (error) {
@@ -87,43 +98,44 @@ app.get('/:uniqueId', async (req, res) => {
 });
 
 
-// --- UPLOAD ROUTE (FINAL FIXES) ---
+// --- UPLOAD ROUTE (FIXED: Saves to mockDatabase) ---
 app.post('/upload', upload.single('sharedFiles'), async (req, res) => {
     console.log('Received POST request at /upload. Processing file...');
     
-    // Check if a file was successfully attached by multer
     if (!req.file) {
         return res.status(400).json({ status: 'error', message: 'No file received.' });
     }
 
     try {
-        // --- Core File Handling ---
-        
-        // FIX 2: This robust line prevents the "ENOENT" error by properly formatting the Data URI
+        // Correct Base64 conversion
         let dataURI = `data:${req.file.mimetype};base64,${req.file.buffer.toString('base64')}`;
 
         // Upload to Cloudinary
         const cloudinaryResponse = await cloudinary.uploader.upload(dataURI, {
-            resource_type: "auto", // Automatically detect file type
-            folder: "famy_share_uploads" // Group uploads in a specific folder
+            resource_type: "auto", 
+            folder: "famy_share_uploads" 
         });
         
-        // --- Dynamic Link Generation and Response ---
+        // --- Dynamic Link Generation and Database Storage ---
 
         const uniqueId = generateUniqueId();
         const uploadedFileName = req.file.originalname;
-        const publicFileUrl = cloudinaryResponse.secure_url; // This is the public URL on Cloudinary
+        const publicFileUrl = cloudinaryResponse.secure_url; 
+        
+        // ** CRITICAL: Save the data to the mock in-memory database **
+        mockDatabase[uniqueId] = {
+            fileName: uploadedFileName,
+            fileUrl: publicFileUrl,
+        };
 
-        console.log(`File uploaded to Cloudinary: ${publicFileUrl}`);
-
-        // TODO: In a real app, save uniqueId, uploadedFileName, and publicFileUrl to a DATABASE here!
+        console.log(`File uploaded to Cloudinary: ${publicFileUrl}. Stored as ID: ${uniqueId}`);
 
         // Send a success response back to the frontend
         res.status(200).json({
             status: 'success',
             uniqueId: uniqueId, 
-            fileName: uploadedFileName, // Send the real file name
-            fileUrl: publicFileUrl     // Send the public URL (optional for now)
+            fileName: uploadedFileName,
+            fileUrl: publicFileUrl
         });
 
     } catch (error) {
@@ -136,7 +148,6 @@ app.post('/upload', upload.single('sharedFiles'), async (req, res) => {
 });
 
 // --- Start Server ---
-
 app.listen(port, () => {
     console.log(`Famy Share Server listening at http://localhost:${port}`);
 });
